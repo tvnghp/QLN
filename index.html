@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agribank Chi nhánh Cần Thơ II • Quản lý nợ 1–5</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- XLSX cho Excel -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.19.3/xlsx.full.min.js" defer></script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- Modal Form Sửa/Thêm -->
+  <div id="editModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-content">
+      <h3 id="modalTitle">Sửa dữ liệu</h3>
+      <form id="editForm">
+        <div class="grid cols-2">
+          <label>Ngày<input type="date" id="editDate" required></label>
+          <label>Nhóm nợ
+            <select id="editGroup" required>
+              <option value="1">Nhóm 1</option>
+              <option value="2">Nhóm 2</option>
+              <option value="3">Nhóm 3</option>
+              <option value="4">Nhóm 4</option>
+              <option value="5">Nhóm 5</option>
+            </select>
+          </label>
+          <label>Khách hàng<input type="text" id="editCustomer" required></label>
+          <label>CCCD<input type="text" id="editCCCD" required></label>
+          <label>Lý do<input type="text" id="editReason" required></label>
+          <label>Số tiền<input type="number" id="editAmount" min="0" step="1000" required></label>
+          <label>Chi nhánh<input type="text" id="editBranch" required disabled></label>
+        </div>
+        <div class="modal-actions">
+          <button type="submit">Lưu</button>
+          <button type="button" class="secondary" onclick="App.closeModal()">Hủy</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+  /* ================== Cấu hình Backend commit ================== */
+  const BACKEND_URL = ""; // ← điền URL Cloudflare Worker/Vercel Function
+  const API_KEY     = ""; // ← chuỗi trùng với secret API_KEY trên backend
+
+  /* ================== Loader + ExcelDB ================== */
+  const Loader = { async ensureXLSX(){ if (window.XLSX) return true; await new Promise(r=>setTimeout(r,50)); return !!window.XLSX; } };
+
+  const ExcelDB = {
+    data: [], users: [],
+    toISO(d){ const yy=d.getFullYear(),mm=String(d.getMonth()+1).padStart(2,'0'),dd=String(d.getDate()).padStart(2,'0'); return `${yy}-${mm}-${dd}`; },
+    parseDate(v){
+      if(!v) return "";
+      if(v instanceof Date && !isNaN(v)) return this.toISO(v);
+      const s=String(v).trim();
+      if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+      const m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if(m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+      return "";
+    },
+    loadFromWorkbook(wb){
+      const sDebt=wb.Sheets['DebtData'];
+      if(!sDebt) throw new Error('Thiếu sheet DebtData');
+      this.data = XLSX.utils.sheet_to_json(sDebt,{defval:''}).map(r=>({
+        date: this.parseDate(r.Date),
+        customer: String(r.CustomerName||r.Customer||''),
+        cccd: String(r.CCCD||''),
+        reason: String(r.Reason||''),
+        group: Number(r.Group||0),
+        amount: Number(r.Amount||0),
+        branch: String(r.Branch||'')
+      })).filter(x=>x.date && x.branch && x.group>=1 && x.group<=5 && x.amount>0);
+      const sUsers=wb.Sheets['Users'];
+      this.users = sUsers? XLSX.utils.sheet_to_json(sUsers,{defval:''}) : [];
+    },
+    async tryFetchDataXlsx(){
+      if(location.protocol==='file:') return false;           // tránh CORS khi mở file://
+      const ok = await Loader.ensureXLSX(); if(!ok) return false;
+      try{
+        const res = await fetch('./data.xlsx',{cache:'no-store'});
+        if(!res.ok) return false;
+        const buf = await res.arrayBuffer();
+        const wb  = XLSX.read(buf,{type:'array'});
+        this.loadFromWorkbook(wb);
+        return true;
+      }catch{ return false; }
+    },
+    async loadFromPickedFile(file){
+      await Loader.ensureXLSX();
+      const buf = await (file.arrayBuffer? file.arrayBuffer(): new Promise((res,rej)=>{const fr=new FileReader(); fr.onload=e=>res(e.target.result); fr.onerror=rej; fr.readAsArrayBuffer(file);})); // fallback khi browser cũ
+      const wb  = XLSX.read(buf,{type:'array'});
+      this.loadFromWorkbook(wb);
+      return true;
+    },
+    buildWorkbookFromState(state){
+      const wb = XLSX.utils.book_new();
+      const debt = state.data.map(r=>({ Date:r.date, Branch:r.branch, CCCD:r.cccd, CustomerName:r.customer, Group:r.group, Amount:r.amount, Reason:r.reason }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(debt), 'DebtData');
+      const users = this.users && this.users.length? this.users : [{Username:'admin', Role:'Admin', Branch:'Hội sở', Salt:'agribank', PasswordHash_SHA256:'', Active:true}];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(users), 'Users');
+      return wb;
+    }
+  };
+
+  /* ================== Ứng dụng ================== */
+  const App = {
+    state: { role:null, branch:null, user:'', editingIndex:null, data:[] },
+
+    async init(){
+      // Thử nạp data.xlsx (khi chạy trên GitHub Pages)
+      const ok = await ExcelDB.tryFetchDataXlsx();
+      if(ok) this.state.data = ExcelDB.data;
+      this.renderLogin(!ok);
+    },
+
+    /* ===== Login ===== */
+    renderLogin(showPick){
+      document.getElementById('app').innerHTML = `
+        <div class="wrap">
+          <div class="card">
+            <h2>Đăng nhập</h2>
+            <div class="toolbar">
+              <label>User<input id="user" placeholder="admin hoặc data_hn"></label>
+              <label>Password<input id="pass" type="password" placeholder="changeme hoặc datahn"></label>
+              <button onclick="App.doLogin()">Đăng nhập</button>
+            </div>
+            ${showPick?`
+            <div class="chip">Không đọc được <b>data.xlsx</b> (có thể do mở bằng <code>file://</code>). Chọn file để nạp thủ công:</div>
+            <div class="toolbar"><input id="pickXlsx" type="file" accept=".xlsx" /> <button class="secondary" onclick="App.pickAndLoad()">📂 Chọn data.xlsx</button></div>
+            `:''}
+            <div class="chip">Demo: <b>admin/changeme</b> (Admin) • <b>data_hn/datahn</b> (DataEntry @ CN Hà Nội)</div>
+          </div>
+        </div>`;
+    },
+    async pickAndLoad(){
+      const inp=document.getElementById('pickXlsx');
+      if(!inp || !inp.files || !inp.files[0]){ alert('Chưa chọn file'); return; }
+      try{ await ExcelDB.loadFromPickedFile(inp.files[0]); this.state.data=ExcelDB.data; alert('Đã nạp dữ liệu từ Excel.'); }
+      catch(e){ alert('Không đọc được file: '+(e?.message||e)); }
+    },
+    doLogin(){
+      const u=document.getElementById('user').value.trim();
+      const p=document.getElementById('pass').value.trim();
+      if(u==='admin' && p==='changeme'){ this.state.role='Admin'; this.state.branch='Hội sở'; this.state.user='admin'; }
+      else if(u==='data_hn' && p==='datahn'){ this.state.role='DataEntry'; this.state.branch='CN Hà Nội'; this.state.user='data_hn'; }
+      else { alert('Sai thông tin'); return; }
+      if(this.state.data.length===0) this.seedSample();
+      this.renderMain();
+    },
+    logout(){ this.state={role:null,branch:null,user:'',editingIndex:null,data:ExcelDB.data||[]}; this.renderLogin(false); },
+
+    /* ===== Sample nếu chưa có excel ===== */
+    seedSample(){
+      const today=new Date(); const toISO=(d)=>{const yy=d.getFullYear(); const mm=String(d.getMonth()+1).padStart(2,'0'); const dd=String(d.getDate()).padStart(2,'0'); return `${yy}-${mm}-${dd}`;};
+      const d=(off)=>{const t=new Date(today); t.setDate(t.getDate()-off); return toISO(t)};
+      this.state.data = [
+        {date:d(1), customer:'Nguyễn Văn A', cccd:'012345678901', reason:'Gia hạn', group:1, amount:5000000, branch:'CN Hà Nội'},
+        {date:d(2), customer:'Trần Thị B',   cccd:'012345678902', reason:'Thu hồi', group:2, amount:3000000, branch:'CN Hà Nội'},
+        {date:d(3), customer:'Công ty C',    cccd:'012345678903', reason:'Phát sinh', group:3, amount:12000000, branch:'CN Đà Nẵng'},
+        {date:d(4), customer:'Công ty D',    cccd:'012345678904', reason:'Điều chỉnh', group:4, amount:2000000, branch:'CN Sài Gòn'},
+        {date:d(5), customer:'Nguyễn Văn E', cccd:'012345678905', reason:'Phát sinh', group:5, amount:7000000, branch:'CN Sài Gòn'}
+      ];
+    },
+
+    /* ===== Main ===== */
+    renderMain(){
+      document.getElementById('app').innerHTML = `
+        <div class="wrap">
+          <div class="topbar">
+            <h2>Agribank Chi nhánh Cần Thơ II</h2>
+            <div class="top-actions">
+              <button class="secondary" onclick="App.exportExcelNow()">⬇️ Xuất Excel (toàn bộ)</button>
+              <button ${(!BACKEND_URL||!API_KEY)?'disabled':''} onclick="App.saveWorkbookToGit()">💾 Lưu vào GitHub</button>
+              <button onclick="App.logout()">🚪 Thoát</button>
+            </div>
+          </div>
+
+          <div class="card" id="dashboard"></div>
+          <div class="card" id="dataEntry"></div>
+          <div class="card" id="report"></div>
+        </div>`;
+
+      this.renderDashboard();
+      this.renderDataTable();
+      this.renderReport();
+    },
+
+    /* ===== Helpers ===== */
+    parseDate(s){ if(!s) return null; const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/); if(!m) return null; return new Date(Number(m[1]),Number(m[2])-1,Number(m[3])); },
+    fmt(n){ return Number(n||0).toLocaleString('vi-VN'); },
+    distinctBranches(){ return Array.from(new Set(this.state.data.map(r=>r.branch))).sort(); },
+
+    /* ===== Dashboard ===== */
+    renderDashboard(){
+      const node=document.getElementById('dashboard');
+      const branches=['ALL',...this.distinctBranches()];
+      node.innerHTML = `
+        <h3>Dashboard theo chi nhánh</h3>
+        <div class="toolbar">
+          <label>Chi nhánh
+            <select id="dbBranch">${branches.map(b=>`<option value="${b}">${b}</option>`).join('')}</select>
+          </label>
+          <label>Kỳ
+            <select id="dbPeriod">
+              <option value="day">Ngày</option>
+              <option value="month">Tháng</option>
+              <option value="year">Năm</option>
+            </select>
+          </label>
+          <label class="dbFrom"><span>Từ ngày</span><input type="date" id="dbFrom"></label>
+          <label class="dbTo"><span>Đến ngày</span><input type="date" id="dbTo"></label>
+          <button class="secondary" onclick="App.refreshDashboard()">Lọc</button>
+        </div>
+        <div id="dbTable"></div>`;
+
+      const onPer=()=>{ const v=dbPeriod.value==='day'; document.querySelector('.dbFrom').classList.toggle('hidden',!v); document.querySelector('.dbTo').classList.toggle('hidden',!v); };
+      dbPeriod.addEventListener('change',onPer); onPer();
+      this.refreshDashboard();
+    },
+    refreshDashboard(){
+      const br=(document.getElementById('dbBranch')||{}).value||'ALL';
+      const per=(document.getElementById('dbPeriod')||{}).value||'day';
+      const from=(document.getElementById('dbFrom')||{}).value||'';
+      const to=(document.getElementById('dbTo')||{}).value||'';
+      let rows=[...this.state.data];
+      if(br!=='ALL') rows=rows.filter(r=>r.branch===br);
+      if(per==='day' && from && to){ const d1=this.parseDate(from), d2=this.parseDate(to); rows=rows.filter(r=>{const d=this.parseDate(r.date);return d && d>=d1 && d<=d2;}); }
+      else if(per==='month'){ const now=new Date(); const ym=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`; rows=rows.filter(r=>String(r.date).startsWith(ym)); }
+      else if(per==='year'){ const y=String(new Date().getFullYear()); rows=rows.filter(r=>String(r.date).startsWith(y)); }
+
+      const map=new Map();
+      rows.forEach(r=>{ const k=r.branch||'(N/A)'; if(!map.has(k)) map.set(k,{g1:0,g2:0,g3:0,g4:0,g5:0,total:0,count:0}); const s=map.get(k); s[`g${r.group}`]+=Number(r.amount||0); s.total+=Number(r.amount||0); s.count++; });
+      const arr=Array.from(map.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+      const html = arr.length?`<table><thead><tr><th>Chi nhánh</th><th>Nhóm 1</th><th>Nhóm 2</th><th>Nhóm 3</th><th>Nhóm 4</th><th>Nhóm 5</th><th>Tổng</th><th># Dòng</th></tr></thead><tbody>${arr.map(([b,v])=>`<tr><td>${b}</td><td>${this.fmt(v.g1)}</td><td>${this.fmt(v.g2)}</td><td>${this.fmt(v.g3)}</td><td>${this.fmt(v.g4)}</td><td>${this.fmt(v.g5)}</td><td>${this.fmt(v.total)}</td><td>${v.count}</td></tr>`).join('')}</tbody></table>` : '<div class="chip">Không có dữ liệu.</div>';
+      document.getElementById('dbTable').innerHTML=html;
+    },
+
+    /* ===== Dữ liệu + CRUD ===== */
+    renderDataTable(){
+      const container=document.getElementById('dataEntry');
+      const rows=this.state.data.map((r,i)=>{
+        const isDE=this.state.role==='DataEntry';
+        const disable = (isDE && r.branch!==this.state.branch) || (this.state.role==='Viewer');
+        return `<tr>
+          <td>${r.date}</td><td>${r.customer}</td><td>${r.cccd}</td>
+          <td>${r.reason}</td><td>${r.group}</td><td>${this.fmt(r.amount)}</td><td>${r.branch}</td>
+          <td>
+            <button onclick="App.openEdit(${i})" ${disable?'disabled':''}>✏️</button>
+            <button class="danger" onclick="App.deleteRow(${i})" ${disable?'disabled':''}>🗑️</button>
+          </td>
+        </tr>`;
+      }).join('');
+      container.innerHTML=`<h3>Nhập liệu theo ngày</h3>
+        <table><thead><tr>
+          <th>Ngày</th><th>Khách hàng</th><th>CCCD</th><th>Lý do</th><th>Nhóm</th><th>Số tiền</th><th>Chi nhánh</th><th>Hành động</th>
+        </tr></thead><tbody>${rows}</tbody></table>`;
+    },
+    openEdit(i){ this.state.editingIndex=i; const r=this.state.data[i]; editDate.value=r.date; editCustomer.value=r.customer; editCCCD.value=r.cccd; editReason.value=r.reason; editGroup.value=r.group; editAmount.value=r.amount; editBranch.value=r.branch; document.getElementById('editModal').classList.remove('hidden'); },
+    closeModal(){ document.getElementById('editModal').classList.add('hidden'); },
+    deleteRow(i){ const r=this.state.data[i]; if(this.state.role==='DataEntry' && this.state.branch!==r.branch){ alert('Không thể xóa khác chi nhánh'); return; } if(!confirm('Xóa dòng này?')) return; this.state.data.splice(i,1); this.renderDashboard(); this.renderDataTable(); this.renderReport(); },
+
+    /* ===== Báo cáo ===== */
+    renderReport(){
+      const container=document.getElementById('report');
+      const branches=['ALL',...this.distinctBranches()];
+      container.innerHTML=`<h3>Báo cáo</h3>
+        <div class="toolbar">
+          <label>Kỳ
+            <select id="rpPeriod">
+              <option value="day" selected>Ngày</option>
+              <option value="month">Tháng (hiện tại)</option>
+              <option value="year">Năm (hiện tại)</option>
+            </select>
+          </label>
+          <label class="rpFrom">Từ ngày<input type="date" id="rpFrom"></label>
+          <label class="rpTo">Đến ngày<input type="date" id="rpTo"></label>
+          <label>Chi nhánh
+            <select id="rpBranch">${branches.map(b=>`<option value="${b}">${b}</option>`).join('')}</select>
+          </label>
+          <button class="secondary" onclick="App.refreshReport()">Lọc</button>
+        </div>
+        <div id="rpTable"></div>`;
+      const onPer=()=>{ const d=rpPeriod.value==='day'; document.querySelector('.rpFrom').classList.toggle('hidden',!d); document.querySelector('.rpTo').classList.toggle('hidden',!d); };
+      rpPeriod.addEventListener('change',onPer); onPer();
+      this.refreshReport();
+    },
+    refreshReport(){
+      const per=rpPeriod.value; const br=rpBranch.value; const from=rpFrom.value; const to=rpTo.value;
+      let rows=[...this.state.data]; if(br!=='ALL') rows=rows.filter(r=>r.branch===br);
+      if(per==='day'){ if(from && to){ const d1=this.parseDate(from), d2=this.parseDate(to); rows=rows.filter(r=>{const d=this.parseDate(r.date);return d && d>=d1 && d<=d2;}); } }
+      else if(per==='month'){ const now=new Date(); const ym=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`; rows=rows.filter(r=>String(r.date).startsWith(ym)); }
+      else if(per==='year'){ const y=String(new Date().getFullYear()); rows=rows.filter(r=>String(r.date).startsWith(y)); }
+      const keyFn = per==='day'? (r=>r.date) : per==='month'? (r=>r.date.slice(0,7)) : (r=>r.date.slice(0,4));
+      const map={}; rows.forEach(r=>{const k=keyFn(r)||'(N/A)'; if(!map[k]) map[k]={g1:0,g2:0,g3:0,g4:0,g5:0,total:0,count:0}; const s=map[k]; s[`g${r.group}`]+=Number(r.amount||0); s.total+=Number(r.amount||0); s.count++;});
+      const arr=Object.entries(map).sort(([a],[b])=>a.localeCompare(b));
+      const html=arr.length?`<table><thead><tr><th>${per==='day'?'Ngày':(per==='month'?'Tháng':'Năm')}</th><th>Nhóm 1</th><th>Nhóm 2</th><th>Nhóm 3</th><th>Nhóm 4</th><th>Nhóm 5</th><th>Tổng</th><th># Dòng</th></tr></thead><tbody>${arr.map(([k,v])=>`<tr><td>${k}</td><td>${this.fmt(v.g1)}</td><td>${this.fmt(v.g2)}</td><td>${this.fmt(v.g3)}</td><td>${this.fmt(v.g4)}</td><td>${this.fmt(v.g5)}</td><td>${this.fmt(v.total)}</td><td>${v.count}</td></tr>`).join('')}</tbody></table>` : '<div class="chip">Không có dữ liệu.</div>';
+      rpTable.innerHTML=html;
+    },
+
+    /* ===== Xuất/Lưu ===== */
+    async exportExcelNow(){ const ok=await Loader.ensureXLSX(); if(!ok){ alert('Không có thư viện XLSX'); return; } const wb = ExcelDB.buildWorkbookFromState(this.state); XLSX.writeFile(wb, 'data_export.xlsx'); },
+    async saveWorkbookToGit(){
+      if(!BACKEND_URL || !API_KEY){ alert('Chưa cấu hình BACKEND_URL / API_KEY'); return; }
+      const ok=await Loader.ensureXLSX(); if(!ok){ alert('Không có thư viện XLSX'); return; }
+      const wb = ExcelDB.buildWorkbookFromState(this.state);
+      const buf = XLSX.write(wb,{bookType:'xlsx',type:'array'});
+      const form = new FormData();
+      form.append('file', new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), 'data.xlsx');
+      form.append('message', `update data.xlsx from web ${new Date().toISOString()}`);
+      form.append('authorName', this.state.user||'WebUser');
+      form.append('authorEmail', 'actions@users.noreply.github.com');
+      try{
+        const res = await fetch(BACKEND_URL, { method:'POST', headers:{'X-Api-Key': API_KEY}, body: form });
+        if(!res.ok){ const t=await res.text(); throw new Error(t); }
+        alert('Đã lưu vào GitHub thành công!');
+      }catch(e){ alert('Commit thất bại: '+(e?.message||e)); }
+    }
+  };
+
+  // Submit modal
+  document.addEventListener('DOMContentLoaded',()=>{
+    document.getElementById('editForm').addEventListener('submit', e=>{
+      e.preventDefault();
+      const i=App.state.editingIndex; if(i==null){ App.closeModal(); return; }
+      const r=App.state.data[i];
+      if(App.state.role==='DataEntry' && App.state.branch!==r.branch){ alert('Không thể sửa khác chi nhánh'); return; }
+      r.date=editDate.value; r.customer=editCustomer.value; r.cccd=editCCCD.value; r.reason=editReason.value; r.group=Number(editGroup.value); r.amount=Number(editAmount.value);
+      App.closeModal(); App.renderDashboard(); App.renderDataTable(); App.renderReport();
+    });
+    App.init();
+  });
+  </script>
+</body>
+</html>
